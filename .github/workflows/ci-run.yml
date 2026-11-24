@@ -1,0 +1,388 @@
+name: Cloud CI Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Target commit SHA (leave empty for main HEAD)'
+        required: false
+        default: ''
+      base_sha:
+        description: 'Base commit SHA for diff checks (optional)'
+        required: false
+        default: ''
+      ref:
+        description: 'Branch or ref label (for concurrency grouping)'
+        required: false
+        default: 'main'
+      pr_number:
+        description: 'Pull request number (optional)'
+        required: false
+        default: ''
+      suite:
+        description: 'Job suite to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - fast
+          - linux
+          - windows
+  repository_dispatch:
+    types: [run-ci]
+
+concurrency:
+  group: ci-run-${{ inputs.ref || github.event.client_payload.ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  resolve:
+    name: Resolve Target
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      base_sha: ${{ steps.meta.outputs.base_sha }}
+      ref: ${{ steps.meta.outputs.ref }}
+      suite: ${{ steps.meta.outputs.suite }}
+      toolchain: ${{ steps.meta.outputs.toolchain }}
+      run_url: ${{ steps.meta.outputs.run_url }}
+    steps:
+      - name: Resolve commit metadata & post pending statuses
+        id: meta
+        env:
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+          IN_SHA: ${{ inputs.sha || github.event.client_payload.sha || '' }}
+          IN_BASE_SHA: ${{ inputs.base_sha || github.event.client_payload.base_sha || '' }}
+          IN_REF: ${{ inputs.ref || github.event.client_payload.ref || 'main' }}
+          IN_SUITE: ${{ inputs.suite || github.event.client_payload.suite || 'all' }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - << 'PYEOF'
+          import base64, json, os, re, urllib.request
+
+          repo = os.environ["TARGET_REPO"].strip()
+          token = os.environ["TARGET_TOKEN"].strip()
+          sha = os.environ["IN_SHA"].strip()
+          base_sha = os.environ["IN_BASE_SHA"].strip()
+          ref = os.environ["IN_REF"].strip() or "main"
+          suite = os.environ["IN_SUITE"].strip() or "all"
+          run_url = os.environ["RUN_URL"]
+
+          def gh(method, url, body=None):
+              data = json.dumps(body).encode("utf-8") if body is not None else None
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              }
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(url, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  raw = r.read().decode("utf-8")
+                  return json.loads(raw) if raw.strip() else {}
+
+          if not sha:
+              c = gh("GET", f"https://api.github.com/repos/{repo}/commits/{ref}")
+              sha = c["sha"]
+              if not base_sha and c.get("parents"):
+                  base_sha = c["parents"][0]["sha"]
+
+          toolchain = "nightly-2026-11-23"
+          try:
+              f = gh("GET", f"https://api.github.com/repos/{repo}/contents/.github/workflows/core.yml?ref={sha}")
+              yml = base64.b64decode(f["content"]).decode("utf-8")
+              m = re.search(r"CI_RUST_TOOLCHAIN:\s*(\S+)", yml)
+              if m:
+                  toolchain = m.group(1)
+          except Exception as e:
+              print(f"Using default toolchain ({e})")
+
+          contexts = ["ci/gate", "ci/dep-guard"]
+          if suite in ("all", "linux"):
+              contexts += ["ci/non-ui-crates", "ci/shell-and-backend"]
+          if suite in ("all", "windows"):
+              contexts += ["ci/windows-check"]
+
+          for ctx in contexts:
+              gh("POST", f"https://api.github.com/repos/{repo}/statuses/{sha}", {
+                  "state": "pending",
+                  "context": ctx,
+                  "description": "Running on cloud CI worker...",
+                  "target_url": run_url,
+              })
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"sha={sha}\n")
+              out.write(f"base_sha={base_sha}\n")
+              out.write(f"ref={ref}\n")
+              out.write(f"suite={suite}\n")
+              out.write(f"toolchain={toolchain}\n")
+              out.write(f"run_url={run_url}\n")
+          print(f"Resolved sha={sha[:8]} base={base_sha[:8] if base_sha else '-'} suite={suite} toolchain={toolchain}")
+          PYEOF
+
+  gate:
+    name: gate
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout worker scripts
+        uses: actions/checkout@v7
+        with:
+          path: _worker
+      - name: Checkout target repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          token: ${{ secrets.TARGET_TOKEN }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          submodules: true
+          path: target_repo
+      - name: Install pengj-templates-cli
+        run: |
+          curl -fsSL https://github.com/pengjiaxusz/pengj-templates/releases/latest/download/install.sh | sh
+          echo "${XDG_DATA_HOME:-$HOME/.local/share}/pengj-templates/bin" >> "$GITHUB_PATH"
+      - name: Install Rust toolchain for rustfmt
+        working-directory: target_repo
+        run: |
+          rustup toolchain install "${{ needs.resolve.outputs.toolchain }}" --profile minimal --component rustfmt
+          rustup override set "${{ needs.resolve.outputs.toolchain }}"
+      - name: Run gate checks
+        working-directory: target_repo
+        env:
+          GATE_BASE: ${{ needs.resolve.outputs.base_sha }}
+        run: |
+          base="${GATE_BASE:-}"
+          if [ -n "$base" ] && git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+            pengj-templates-cli gate check-commits --base "$base"
+          else
+            pengj-templates-cli gate check-commits
+          fi
+          pengj-templates-cli gate check
+          pengj-templates-cli check-lang --dir .
+          cargo fmt --check
+      - name: Report commit status
+        if: always()
+        env:
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+        run: |
+          STATE="failure"
+          DESC="Gate checks failed"
+          if [ "${{ job.status }}" = "success" ]; then
+            STATE="success"
+            DESC="All gate checks passed"
+          fi
+          python3 _worker/scripts/report_status.py "${{ needs.resolve.outputs.sha }}" "$STATE" "ci/gate" "$DESC" "${{ needs.resolve.outputs.run_url }}"
+
+  dep-guard:
+    name: dep-guard
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout worker scripts
+        uses: actions/checkout@v7
+        with:
+          path: _worker
+      - name: Checkout target repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          token: ${{ secrets.TARGET_TOKEN }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: target_repo
+      - name: Run dep-guard
+        working-directory: target_repo
+        run: |
+          python3 scripts/dep-guard.py --self-test
+          python3 scripts/dep-guard.py
+      - name: Report commit status
+        if: always()
+        env:
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+        run: |
+          STATE="failure"
+          DESC="Dependency guard failed"
+          if [ "${{ job.status }}" = "success" ]; then
+            STATE="success"
+            DESC="Dependency guard passed"
+          fi
+          python3 _worker/scripts/report_status.py "${{ needs.resolve.outputs.sha }}" "$STATE" "ci/dep-guard" "$DESC" "${{ needs.resolve.outputs.run_url }}"
+
+  non-ui-crates:
+    name: non-ui-crates
+    needs: resolve
+    if: needs.resolve.outputs.suite == 'all' || needs.resolve.outputs.suite == 'linux'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout worker scripts
+        uses: actions/checkout@v7
+        with:
+          path: _worker
+      - name: Checkout target repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          token: ${{ secrets.TARGET_TOKEN }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          submodules: true
+          path: target_repo
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - name: Install Rust toolchain
+        working-directory: target_repo
+        run: |
+          rustup toolchain install "${{ needs.resolve.outputs.toolchain }}" --profile minimal --component rustfmt,clippy
+          rustup override set "${{ needs.resolve.outputs.toolchain }}"
+          rustc -vV
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: target_repo
+          shared-key: proxy-core-linux
+          cache-on-failure: true
+      - name: Run core job from target core.yml
+        working-directory: target_repo
+        run: python3 "$GITHUB_WORKSPACE/_worker/scripts/run_core_job.py" core
+      - name: Report commit status
+        if: always()
+        env:
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+        run: |
+          STATE="failure"
+          DESC="Non-UI core crates check failed"
+          if [ "${{ job.status }}" = "success" ]; then
+            STATE="success"
+            DESC="Non-UI core crates passed"
+          fi
+          python3 _worker/scripts/report_status.py "${{ needs.resolve.outputs.sha }}" "$STATE" "ci/non-ui-crates" "$DESC" "${{ needs.resolve.outputs.run_url }}"
+
+  shell-and-backend:
+    name: shell-and-backend
+    needs: resolve
+    if: needs.resolve.outputs.suite == 'all' || needs.resolve.outputs.suite == 'linux'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout worker scripts
+        uses: actions/checkout@v7
+        with:
+          path: _worker
+      - name: Checkout target repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          token: ${{ secrets.TARGET_TOKEN }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          submodules: true
+          path: target_repo
+      - name: Install lld & OpenSSL dev
+        run: sudo apt-get update && sudo apt-get install -y lld pkg-config libssl-dev
+      - name: Install Rust toolchain
+        working-directory: target_repo
+        run: |
+          rustup toolchain install "${{ needs.resolve.outputs.toolchain }}" --profile minimal --component rustfmt,clippy
+          rustup override set "${{ needs.resolve.outputs.toolchain }}"
+          rustc -vV
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: target_repo
+          shared-key: proxy-shell-linux
+          cache-on-failure: true
+      - name: Cache PostgreSQL runtime
+        uses: actions/cache@v6
+        with:
+          path: target_repo/target/debug/postgres
+          key: proxy-postgres-runtime-18-${{ runner.os }}
+      - name: Run shell-and-backend job from target core.yml
+        working-directory: target_repo
+        run: python3 "$GITHUB_WORKSPACE/_worker/scripts/run_core_job.py" shell-and-backend
+      - name: Report commit status
+        if: always()
+        env:
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+        run: |
+          STATE="failure"
+          DESC="Shell & backend check failed"
+          if [ "${{ job.status }}" = "success" ]; then
+            STATE="success"
+            DESC="Shell & backend passed"
+          fi
+          python3 _worker/scripts/report_status.py "${{ needs.resolve.outputs.sha }}" "$STATE" "ci/shell-and-backend" "$DESC" "${{ needs.resolve.outputs.run_url }}"
+
+  windows-check:
+    name: windows-check
+    needs: resolve
+    if: needs.resolve.outputs.suite == 'all' || needs.resolve.outputs.suite == 'windows'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout worker scripts
+        uses: actions/checkout@v7
+        with:
+          path: _worker
+      - name: Checkout target repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          token: ${{ secrets.TARGET_TOKEN }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          submodules: true
+          path: target_repo
+      - name: Install Rust toolchain
+        shell: pwsh
+        working-directory: target_repo
+        run: |
+          rustup toolchain install "${{ needs.resolve.outputs.toolchain }}" --profile minimal --component rustfmt,clippy
+          rustup override set "${{ needs.resolve.outputs.toolchain }}"
+          rustc -vV
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: target_repo
+          shared-key: proxy-windows
+          cache-on-failure: true
+      - name: Cache PostgreSQL runtime
+        uses: actions/cache@v6
+        with:
+          path: target_repo/target/debug/postgres
+          key: proxy-postgres-runtime-18-${{ runner.os }}
+      - name: Run windows-check job from target core.yml
+        shell: pwsh
+        working-directory: target_repo
+        run: python "$env:GITHUB_WORKSPACE\_worker\scripts\run_core_job.py" windows-check
+      - name: Report commit status
+        if: always()
+        shell: pwsh
+        env:
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+        run: |
+          $state = if ("${{ job.status }}" -eq "success") { "success" } else { "failure" }
+          $desc = if ($state -eq "success") { "Windows workspace check passed" } else { "Windows workspace check failed" }
+          python "$env:GITHUB_WORKSPACE\_worker\scripts\report_status.py" "${{ needs.resolve.outputs.sha }}" $state "ci/windows-check" $desc "${{ needs.resolve.outputs.run_url }}"
