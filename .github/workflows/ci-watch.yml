@@ -1,0 +1,105 @@
+name: CI Auto Watcher
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Poll Target Repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check open PRs and main HEAD and dispatch CI
+        env:
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+          WORKER_REPO: ${{ github.repository }}
+        run: |
+          python3 - << 'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          target_repo = os.environ.get("TARGET_REPO", "").strip()
+          token = os.environ.get("TARGET_TOKEN", "").strip()
+          worker_repo = os.environ["WORKER_REPO"]
+
+          if not target_repo or not token:
+              print("TARGET_REPO or TARGET_TOKEN secret is not configured yet. Skipping.")
+              sys.exit(0)
+
+          def gh(method, url, body=None):
+              data = json.dumps(body).encode("utf-8") if body is not None else None
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              }
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(url, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  raw = r.read().decode("utf-8")
+                  return r.status, json.loads(raw) if raw.strip() else {}
+
+          candidates = []
+          _, prs = gh("GET", f"https://api.github.com/repos/{target_repo}/pulls?state=open&per_page=20")
+          for pr in prs:
+              candidates.append({
+                  "sha": pr["head"]["sha"],
+                  "base_sha": pr["base"]["sha"],
+                  "ref": pr["head"]["ref"],
+                  "pr_number": str(pr["number"]),
+              })
+
+          try:
+              _, main_commit = gh("GET", f"https://api.github.com/repos/{target_repo}/commits/main")
+              parents = main_commit.get("parents") or []
+              candidates.append({
+                  "sha": main_commit["sha"],
+                  "base_sha": parents[0]["sha"] if parents else "",
+                  "ref": "main",
+                  "pr_number": "",
+              })
+          except urllib.error.HTTPError as e:
+              print(f"Could not inspect main branch: {e.code}")
+
+          seen_shas = set()
+          dispatched = 0
+          for c in candidates:
+              sha = c["sha"]
+              if sha in seen_shas:
+                  continue
+              seen_shas.add(sha)
+
+              _, statuses = gh("GET", f"https://api.github.com/repos/{target_repo}/commits/{sha}/statuses?per_page=30")
+              contexts = {s.get("context") for s in statuses}
+              if "ci/proxy-dispatch" in contexts:
+                  continue
+
+              gh("POST", f"https://api.github.com/repos/{target_repo}/statuses/{sha}", {
+                  "state": "success",
+                  "context": "ci/proxy-dispatch",
+                  "description": "Dispatched to cloud CI worker",
+                  "target_url": f"https://github.com/{worker_repo}/actions/workflows/ci-run.yml",
+              })
+
+              st, _ = gh("POST", f"https://api.github.com/repos/{worker_repo}/actions/workflows/ci-run.yml/dispatches", {
+                  "ref": "main",
+                  "inputs": {
+                      "sha": sha,
+                      "base_sha": c["base_sha"],
+                      "ref": c["ref"],
+                      "pr_number": c["pr_number"],
+                      "suite": "all",
+                  },
+              })
+              print(f"Dispatched CI for {sha[:8]} (ref={c['ref']}, pr={c['pr_number'] or '-'}): HTTP {st}")
+              dispatched += 1
+
+          print(f"Poll complete. Checked {len(seen_shas)} commit(s), dispatched {dispatched}.")
+          PYEOF
